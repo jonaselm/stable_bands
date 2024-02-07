@@ -1,0 +1,100 @@
+---
+title: "Stable Bands: Basic Implementation"
+author: Jonas Elmerraji (jonaselm@hey.com)
+output: html_notebook
+---
+
+This notebook contains a full, clean implementation of stable bands, including weekly projection to daily and rolling estimation. This 
+software is provided as-is for informational purposes with no implied license. 
+
+As implemented, this code requires STABLE for R, available from http://robustanalysis.com/. A free open source alternative would be
+to use the `alphastable` package in place of the stable.fit.mle.restricted() function for parameter estimation, and then using the `stabledist` 
+package in place of the qstable() function for quantile calculation. 
+
+```{r}
+library(tidyverse)
+library(tidyquant)
+library(stable)
+library(roll)
+```
+
+Load price data from your provider into your R environment as a tibble called price_data. The code below assumes price_data has the following standard Bloomberg column names: date, PX_LAST, PX_OPEN, PX_HIGH, PX_LOW.
+
+```{r}
+#S&P 500 
+#load("data/SPX.Rdata")
+
+```
+
+Add stable bands to your price_data object at each observation.
+
+```{r}
+# Calculate weekly invariants
+px_weekly <- price_data |> tq_transmute(select = PX_LAST:PX_LOW,
+                                        mutate_fun = to.period,
+                                        period = "weeks")
+
+# Calculate log-returns
+price_data <- price_data |> select(date, PX_LAST) |> mutate(log_return = log(PX_LAST/lag(PX_LAST)))
+px_weekly <- px_weekly |> select(date, PX_LAST) |> mutate(log_return = log(PX_LAST/lag(PX_LAST)))
+
+# Calculate 20-period SMA
+px_weekly <- px_weekly |> mutate(SMA = SMA(PX_LAST, n=20))
+price_data <- price_data |> mutate(SMA = SMA(PX_LAST, n=20))
+
+# Calculate 20-period sd
+px_weekly <- px_weekly |> mutate(sd = roll_sd(PX_LAST, 20),
+                                 sd_logret = roll_sd(log_return, 20))
+
+price_data <- price_data |> mutate(sd = roll_sd(PX_LAST, 20),
+                                 sd_logret = roll_sd(log_return, 20))
+
+
+# Initialize parameter placeholder
+px_weekly <- px_weekly |> mutate(
+  alpha = NA,
+  beta = NA, 
+  gamma = NA, 
+  delta = NA
+)
+
+# Estimate rolling stable parameters
+# Loop through data, taking full filtration
+# Here, we fix beta, delta and only estimate alpha, gamma parameter
+
+for (i in 30:nrow(px_weekly)){ # Starting at 3: 2 because we're estimating 2 parameters to start, plus 1 to ensure no lookahead (only fit on prior data)
+  chunk <- px_weekly[2:(i-1), ]$log_return #omit leading NA
+  param_estimates <- stable.fit.mle.restricted(chunk, theta = c(0,0,0,0), restriction = c(0,1,0,1), param = 1) # Note, parameterization doesn't matter since beta = 0
+  
+  # Store results
+  px_weekly[i,]$alpha <- param_estimates[1]
+  px_weekly[i,]$beta <- param_estimates[2]
+  px_weekly[i,]$gamma <- param_estimates[3]
+  px_weekly[i,]$delta <- param_estimates[4]
+  
+}
+
+# Quantile of interest - percent of excursions
+qtile <- 0.05
+norm_qtile <- qnorm(qtile, lower.tail = F)
+qtile <- qtile/2
+
+### Project weekly to daily
+# Columns to keep from px_weekly
+keeps <- px_weekly %>% dplyr::select(date, alpha, gamma)
+
+# Merge and locf observations each week to fill missing days
+price_data <- price_data %>% left_join(keeps, by = "date") %>% na.locf()
+
+# Set proj_factor = hs; 
+proj_factor <- 5*(1/5)
+
+# Project results
+price_data <- price_data |> na.omit() |> rowwise() |> 
+  mutate(upside_band_log = qstable(1-qtile, alpha, beta = 0, (proj_factor*(gamma^alpha))^(1/alpha), 0, param = 1),
+                                   downside_band_log = qstable(qtile, alpha, beta = 0, (proj_factor*(gamma^alpha))^(1/alpha), 0, param = 1),
+         upside_band_ret = exp(upside_band_log)-1, downside_band_ret = exp(downside_band_log)-1,
+         upside_band = SMA*(1+upside_band_ret), downside_band = SMA*(1+downside_band_ret))
+
+```
+
